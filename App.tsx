@@ -57,6 +57,13 @@ export default function App() {
     ));
   };
 
+  // Helper to update a specific project's config (used by the background players)
+  const updateProjectConfig = (id: string, newConfig: VideoConfig) => {
+    setProjects(prev => prev.map(p => 
+        p.id === id ? { ...p, config: newConfig } : p
+    ));
+  };
+
   const handleCreateProject = () => {
       const newId = `proj-${Date.now()}`;
       const newProject: Project = {
@@ -89,6 +96,7 @@ export default function App() {
   return (
     <div className="flex h-screen w-screen bg-[#0f172a] overflow-hidden">
       {/* Left Configuration Panel */}
+      {/* Sidebar always controls the ACTIVE project */}
       <Sidebar 
         config={activeProject.config} 
         onChange={updateConfig}
@@ -102,13 +110,36 @@ export default function App() {
         onRenameProject={handleRenameProject}
       />
       
-      {/* Right Preview Panel */}
-      {/* We use activeProjectId as key to force re-initialization of players when switching projects */}
-      <PreviewPlayer 
-        key={activeProjectId} 
-        config={activeProject.config} 
-        onChange={updateConfig} 
-      />
+      {/* Right Preview Panel Container */}
+      <div className="flex-1 relative overflow-hidden bg-black">
+        {/* 
+            CRITICAL: We map and render ALL projects.
+            We use absolute positioning to stack them.
+            The ACTIVE project has z-index 10.
+            Inactive projects have z-index 0.
+            
+            IMPORTANT: We keep opacity at 100 for all of them. 
+            Since the active project covers the screen (it has a background), 
+            we don't need to hide the others. This ensures the browser 
+            doesn't 'optimize away' the rendering loop of the background projects,
+            keeping the export running.
+        */}
+        {projects.map((project) => (
+            <div 
+                key={project.id}
+                className={`absolute inset-0 w-full h-full transition-all duration-300 ${
+                    project.id === activeProjectId 
+                        ? 'z-10 pointer-events-auto' 
+                        : 'z-0 pointer-events-none'
+                }`}
+            >
+                <PreviewPlayer 
+                    config={project.config} 
+                    onChange={(newCfg) => updateProjectConfig(project.id, newCfg)} 
+                />
+            </div>
+        ))}
+      </div>
     </div>
   );
 }
