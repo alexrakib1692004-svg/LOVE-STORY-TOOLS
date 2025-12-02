@@ -75,6 +75,18 @@ export const PreviewPlayer: React.FC<PreviewPlayerProps> = ({ config, onChange }
   const { w: CANVAS_WIDTH, h: CANVAS_HEIGHT } = getCanvasDimensions();
   const PADDING_X = CANVAS_WIDTH * 0.05; 
 
+  // --- Prevent Tab Close Warning ---
+  useEffect(() => {
+    const handleBeforeUnload = (e: BeforeUnloadEvent) => {
+        if (isExporting) {
+            e.preventDefault();
+            e.returnValue = ''; // Chrome requires this
+        }
+    };
+    window.addEventListener('beforeunload', handleBeforeUnload);
+    return () => window.removeEventListener('beforeunload', handleBeforeUnload);
+  }, [isExporting]);
+
   // --- Font Loading ---
   useEffect(() => {
     document.fonts.ready.then(() => {
@@ -487,47 +499,43 @@ export const PreviewPlayer: React.FC<PreviewPlayerProps> = ({ config, onChange }
 
     if (isExporting) {
         // --- BACKGROUND FRIENDLY EXPORT LOOP (Web Worker) ---
-        // Using a Blob URL for worker to avoid separate file requirement
         const blob = new Blob([WORKER_CODE], { type: 'application/javascript' });
         const worker = new Worker(URL.createObjectURL(blob));
         workerRef.current = worker;
 
         worker.onmessage = () => {
-             // 1. Calculate new time
-             if (config.audioUrl && audioRef.current && isAudioReady && !audioError) {
-                 // Trust audio time if available
-                 currentTimeRef.current = audioRef.current.currentTime;
-             } else {
-                 // Manual increment based on wall clock
-                 const now = performance.now();
-                 const delta = (now - lastTimeRef.current) / 1000;
-                 lastTimeRef.current = now;
-                 currentTimeRef.current += delta;
-             }
+             // CRITICAL FIX: Always rely on system time delta for export.
+             // Browsers throttle 'audio.currentTime' in background tabs, causing stutter.
+             const now = performance.now();
+             const delta = (now - lastTimeRef.current) / 1000;
+             lastTimeRef.current = now;
              
-             // 2. Render Frame Synchronously
+             // Increment internal time based on elapsed real-world time
+             // This ensures visual smoothness even if audio element lags in background.
+             currentTimeRef.current += delta;
+             
              renderFrame(currentTimeRef.current);
-             
-             // 3. Update React State (UI) - might be throttled but that's fine
              setCurrentTime(currentTimeRef.current);
 
-             // 4. Check End Condition
+             // Check End Condition
+             // We add a small buffer (+1s) to ensure audio finishes if it's slightly desynced
              const isEnded = (config.audioUrl && audioRef.current?.ended) || 
-                             (currentTimeRef.current >= maxDuration + 1); // +1 buffer
+                             (currentTimeRef.current >= maxDuration + 0.5); 
              
              if (isEnded) {
-                 finishExport(); // Triggers unmount of worker via isExporting change
+                 finishExport(); 
              }
         };
 
         lastTimeRef.current = performance.now();
-        // Start worker ticking at approx video fps
+        // Start worker ticking at requested FPS
         worker.postMessage({ action: 'start', fps: config.fps });
 
     } else if (isPlaying) {
         // --- STANDARD FOREGROUND LOOP (requestAnimationFrame) ---
         const loop = () => {
             if (config.audioUrl && audioRef.current && isAudioReady && !audioError) {
+                // In foreground, we can trust audio time for perfect lipsync
                 const t = audioRef.current.currentTime;
                 currentTimeRef.current = t;
                 setCurrentTime(t);
