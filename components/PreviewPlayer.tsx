@@ -8,6 +8,21 @@ interface PreviewPlayerProps {
   onChange?: (newConfig: VideoConfig) => void;
 }
 
+// Background Worker Code to prevent throttling when tab is inactive
+const WORKER_CODE = `
+  let intervalId;
+  self.onmessage = function(e) {
+    if (e.data.action === 'start') {
+      const interval = 1000 / e.data.fps;
+      intervalId = setInterval(() => {
+        postMessage('tick');
+      }, interval);
+    } else if (e.data.action === 'stop') {
+      clearInterval(intervalId);
+    }
+  };
+`;
+
 export const PreviewPlayer: React.FC<PreviewPlayerProps> = ({ config, onChange }) => {
   const [isPlaying, setIsPlaying] = useState(false);
   const [isExporting, setIsExporting] = useState(false);
@@ -17,6 +32,7 @@ export const PreviewPlayer: React.FC<PreviewPlayerProps> = ({ config, onChange }
   const [audioError, setAudioError] = useState(false);
   const [fontsLoaded, setFontsLoaded] = useState(false);
   
+  // Refs
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   const audioRef = useRef<HTMLAudioElement>(null);
@@ -26,6 +42,10 @@ export const PreviewPlayer: React.FC<PreviewPlayerProps> = ({ config, onChange }
   const bgImageRef = useRef<HTMLImageElement | null>(null);
   const watermarkImageRef = useRef<HTMLImageElement | null>(null);
   const logoImageRef = useRef<HTMLImageElement | null>(null);
+  
+  // Time tracking ref for sync access in loops
+  const currentTimeRef = useRef(0);
+  const workerRef = useRef<Worker | null>(null);
 
   // Dragging State
   const isDraggingRef = useRef(false);
@@ -36,19 +56,14 @@ export const PreviewPlayer: React.FC<PreviewPlayerProps> = ({ config, onChange }
   // Audio Engine Refs
   const audioContextRef = useRef<AudioContext | null>(null);
   const sourceNodeRef = useRef<MediaElementAudioSourceNode | null>(null);
-  const mainAudioGainNodeRef = useRef<GainNode | null>(null); // New Gain Node for Main Audio
-  
-  // Monitor Gain Node (For Muting during Export)
+  const mainAudioGainNodeRef = useRef<GainNode | null>(null);
   const monitorGainNodeRef = useRef<GainNode | null>(null);
-
-  // BG Music Refs
   const bgMusicSourceNodeRef = useRef<MediaElementAudioSourceNode | null>(null);
   const bgMusicGainNodeRef = useRef<GainNode | null>(null);
   const bgMusicMonitorGainNodeRef = useRef<GainNode | null>(null);
-
   const destNodeRef = useRef<MediaStreamAudioDestinationNode | null>(null);
 
-  // --- Dynamic Aspect Ratio Calculations ---
+  // --- Dynamic Aspect Ratio ---
   const getCanvasDimensions = () => {
     switch (config.aspectRatio) {
         case '9:16': return { w: 1080, h: 1920 };
@@ -58,11 +73,9 @@ export const PreviewPlayer: React.FC<PreviewPlayerProps> = ({ config, onChange }
     }
   };
   const { w: CANVAS_WIDTH, h: CANVAS_HEIGHT } = getCanvasDimensions();
-
-  // Scale factor for padding based on width to keep it proportional
   const PADDING_X = CANVAS_WIDTH * 0.05; 
 
-  // --- Font Loading Monitor ---
+  // --- Font Loading ---
   useEffect(() => {
     document.fonts.ready.then(() => {
       setFontsLoaded(true);
@@ -71,9 +84,7 @@ export const PreviewPlayer: React.FC<PreviewPlayerProps> = ({ config, onChange }
 
   // --- Text Layout Engine ---
   const lines = useMemo(() => {
-    if (!fontsLoaded && document.fonts.status !== 'loaded') {
-        // Optional wait
-    }
+    if (!fontsLoaded && document.fonts.status !== 'loaded') {}
 
     const tempCanvas = document.createElement('canvas');
     const ctx = tempCanvas.getContext('2d');
@@ -139,7 +150,11 @@ export const PreviewPlayer: React.FC<PreviewPlayerProps> = ({ config, onChange }
   }, [config.autoScrollSpeed, audioDuration, totalTextHeight, CANVAS_HEIGHT, config.scrollSpeed]);
 
   const effectiveScrollSpeed = config.autoScrollSpeed ? calculatedAutoSpeed : config.scrollSpeed;
-
+  
+  // Calculate Max Duration
+  const totalDistance = totalTextHeight + CANVAS_HEIGHT; 
+  const visualDuration = totalDistance / (effectiveScrollSpeed || 50);
+  const maxDuration = config.audioUrl && audioDuration > 0 ? audioDuration : visualDuration;
 
   // --- Image Loaders ---
   useEffect(() => {
@@ -175,7 +190,7 @@ export const PreviewPlayer: React.FC<PreviewPlayerProps> = ({ config, onChange }
     }
   }, [config.logoUrl]);
 
-  // --- Audio Engine Setup (Persistent) ---
+  // --- Audio Engine Setup ---
   useEffect(() => {
     if (!audioContextRef.current) {
         const AudioContext = window.AudioContext || (window as any).webkitAudioContext;
@@ -185,25 +200,22 @@ export const PreviewPlayer: React.FC<PreviewPlayerProps> = ({ config, onChange }
     const ctx = audioContextRef.current;
     if (!ctx) return;
 
-    // 1. Setup Stream Destination (The Mixer Output)
     if (!destNodeRef.current) {
         destNodeRef.current = ctx.createMediaStreamDestination();
     }
     
-    // Setup Monitor Gain Node (To mute local speakers during export)
     if (!monitorGainNodeRef.current) {
         monitorGainNodeRef.current = ctx.createGain();
         monitorGainNodeRef.current.gain.value = 0.95; 
         monitorGainNodeRef.current.connect(ctx.destination);
     }
 
-    // Initialize Main Audio Gain Node if not exists
     if (!mainAudioGainNodeRef.current) {
         mainAudioGainNodeRef.current = ctx.createGain();
         mainAudioGainNodeRef.current.gain.value = config.mainAudioVolume ?? 1.0;
     }
 
-    // 2. Main Audio Route
+    // Main Audio Route
     const mainAudio = audioRef.current;
     if (config.audioUrl && mainAudio) {
         if (!sourceNodeRef.current) {
@@ -214,21 +226,18 @@ export const PreviewPlayer: React.FC<PreviewPlayerProps> = ({ config, onChange }
             try { sourceNodeRef.current.disconnect(); } catch (e) {}
             try { mainAudioGainNodeRef.current.disconnect(); } catch (e) {}
 
-            // Connect Source -> Main Gain
             sourceNodeRef.current.connect(mainAudioGainNodeRef.current);
 
-            // Connect Main Gain -> Monitor
             if (monitorGainNodeRef.current) {
                 mainAudioGainNodeRef.current.connect(monitorGainNodeRef.current);
             }
-            // Connect Main Gain -> Recorder Destination
             if (destNodeRef.current) {
                 mainAudioGainNodeRef.current.connect(destNodeRef.current);
             }
         }
     }
 
-    // 3. Background Music Route
+    // Background Music Route
     const bgMusic = bgMusicRef.current;
     if (config.bgMusicUrl && bgMusic) {
         if (!bgMusicSourceNodeRef.current) {
@@ -237,13 +246,11 @@ export const PreviewPlayer: React.FC<PreviewPlayerProps> = ({ config, onChange }
         if (!bgMusicGainNodeRef.current) {
              bgMusicGainNodeRef.current = ctx.createGain();
         }
-        // Monitor Gain for BG Music
         if (!bgMusicMonitorGainNodeRef.current) {
             bgMusicMonitorGainNodeRef.current = ctx.createGain();
             bgMusicMonitorGainNodeRef.current.connect(ctx.destination);
         }
 
-        // Apply Volume
         if (bgMusicGainNodeRef.current) {
             bgMusicGainNodeRef.current.gain.value = config.bgMusicVolume;
         }
@@ -254,11 +261,9 @@ export const PreviewPlayer: React.FC<PreviewPlayerProps> = ({ config, onChange }
         if (bgMusicSourceNodeRef.current && bgMusicGainNodeRef.current) {
              try { bgMusicSourceNodeRef.current.disconnect(); } catch(e) {}
              
-             // Route to Recorder (Gain -> Dest)
              bgMusicSourceNodeRef.current.connect(bgMusicGainNodeRef.current);
              if (destNodeRef.current) bgMusicGainNodeRef.current.connect(destNodeRef.current);
 
-             // Route to Monitor
              if (bgMusicMonitorGainNodeRef.current) {
                  bgMusicSourceNodeRef.current.connect(bgMusicMonitorGainNodeRef.current);
              }
@@ -288,12 +293,9 @@ export const PreviewPlayer: React.FC<PreviewPlayerProps> = ({ config, onChange }
       const targetGain = shouldMute ? 0 : 0.95; 
       const rampTime = 0.1;
 
-      // Mute Main Audio Monitor
       if (monitorGainNodeRef.current) {
           monitorGainNodeRef.current.gain.setTargetAtTime(targetGain, ctx.currentTime, rampTime);
       }
-
-      // Mute BG Music Monitor
       if (bgMusicMonitorGainNodeRef.current) {
           const bgTarget = shouldMute ? 0 : config.bgMusicVolume;
           bgMusicMonitorGainNodeRef.current.gain.setTargetAtTime(bgTarget, ctx.currentTime, rampTime);
@@ -301,11 +303,10 @@ export const PreviewPlayer: React.FC<PreviewPlayerProps> = ({ config, onChange }
       
   }, [isExporting, config.muteOnExport, config.bgMusicVolume]);
 
-  // --- Sync Main Audio Element Source ---
+  // --- Sync Audio Elements ---
   useEffect(() => {
     const audio = audioRef.current;
     if (!audio) return;
-
     if (config.audioUrl) {
         audio.src = config.audioUrl;
         audio.load();
@@ -322,14 +323,12 @@ export const PreviewPlayer: React.FC<PreviewPlayerProps> = ({ config, onChange }
     }
   }, [config.audioUrl]);
 
-  // --- Sync BG Music Source ---
   useEffect(() => {
       const bgAudio = bgMusicRef.current;
       if (!bgAudio) return;
-
       if (config.bgMusicUrl) {
           bgAudio.src = config.bgMusicUrl;
-          bgAudio.loop = true; // Auto loop for BG music
+          bgAudio.loop = true;
           bgAudio.load();
       } else {
           bgAudio.removeAttribute('src');
@@ -337,33 +336,27 @@ export const PreviewPlayer: React.FC<PreviewPlayerProps> = ({ config, onChange }
       }
   }, [config.bgMusicUrl]);
 
-
   // --- Render Frame Function ---
   const renderFrame = (time: number) => {
     const canvas = canvasRef.current;
     const ctx = canvas?.getContext('2d');
     if (!canvas || !ctx) return;
 
-    // Clear
     ctx.clearRect(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT);
     ctx.globalCompositeOperation = 'source-over';
     
-    // 1. Draw Background
-    // Default to solid color
+    // 1. Background
     ctx.fillStyle = config.backgroundColor;
     ctx.fillRect(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT);
 
-    // If image exists, draw it over
     if (config.backgroundImage && bgImageRef.current) {
        const img = bgImageRef.current;
-       // Cover logic
        const scale = Math.max(CANVAS_WIDTH / img.width, CANVAS_HEIGHT / img.height);
        const x = (CANVAS_WIDTH / 2) - (img.width / 2) * scale;
        const y = (CANVAS_HEIGHT / 2) - (img.height / 2) * scale;
        ctx.drawImage(img, x, y, img.width * scale, img.height * scale);
     }
 
-    // Helper for Drawing Images
     const drawImageElement = (img: HTMLImageElement, x: number, y: number, scale: number, opacity: number) => {
         const wWidth = img.width * scale;
         const wHeight = img.height * scale;
@@ -374,7 +367,6 @@ export const PreviewPlayer: React.FC<PreviewPlayerProps> = ({ config, onChange }
         ctx.restore();
     };
 
-    // Helper for Drawing Text Watermark
     const drawTextWatermark = () => {
         if (!config.watermarkText) return;
         ctx.save();
@@ -388,23 +380,19 @@ export const PreviewPlayer: React.FC<PreviewPlayerProps> = ({ config, onChange }
         ctx.restore();
     };
 
-    // 2. Draw Image Watermark (If Layer is BACK)
+    // 2. Back Watermarks
     if (config.watermarkUrl && watermarkImageRef.current && config.watermarkLayer === 'back') {
         drawImageElement(watermarkImageRef.current, config.watermarkX, config.watermarkY, config.watermarkScale, config.watermarkOpacity);
     }
-    
-    // 3. Draw Text Watermark (If Layer is BACK)
     if (config.watermarkText && config.watermarkTextLayer === 'back') {
         drawTextWatermark();
     }
 
-    // 4. Setup Main Text
+    // 3. Main Text
     ctx.shadowColor = 'rgba(0, 0, 0, 0.8)';
     ctx.shadowBlur = 6;
     ctx.shadowOffsetX = 3;
     ctx.shadowOffsetY = 3;
-
-    // CRITICAL: Always use 'left' for drawing to prevent word shifting
     ctx.textAlign = 'left'; 
     ctx.textBaseline = 'top';
     const fontName = config.fontFamily.split(',')[0].trim().replace(/['"]/g, '');
@@ -416,11 +404,8 @@ export const PreviewPlayer: React.FC<PreviewPlayerProps> = ({ config, onChange }
     const centerX = CANVAS_WIDTH / 2;
     
     lines.forEach((line) => {
-      // Relaxed visibility check
       if (yPos + lineHeight > 0 && yPos <= CANVAS_HEIGHT) {
-        
-        // Calculate Line Start Position based on alignment
-        let xPos = PADDING_X; // Default left
+        let xPos = PADDING_X; 
         if (config.textAlign === 'center') {
             xPos = centerX - (line.width / 2);
         } else if (config.textAlign === 'right') {
@@ -430,45 +415,38 @@ export const PreviewPlayer: React.FC<PreviewPlayerProps> = ({ config, onChange }
         line.segments.forEach(seg => {
           ctx.fillStyle = config.textColor;
           ctx.fillText(seg.text, xPos, yPos);
-          // Advance xPos by the segment width
           xPos += seg.width;
         });
       }
       yPos += lineHeight;
     });
 
-    // 5. Draw Image Watermark (If Layer is FRONT)
+    // 4. Front Watermarks
     if (config.watermarkUrl && watermarkImageRef.current && config.watermarkLayer === 'front') {
         drawImageElement(watermarkImageRef.current, config.watermarkX, config.watermarkY, config.watermarkScale, config.watermarkOpacity);
     }
-    
-    // 6. Draw Text Watermark (If Layer is FRONT)
     if (config.watermarkText && config.watermarkTextLayer === 'front') {
         drawTextWatermark();
     }
 
-    // 7. Draw Logo (Always Top Overlay)
+    // 5. Logo
     if (config.logoUrl && logoImageRef.current) {
         drawImageElement(logoImageRef.current, config.logoX, config.logoY, config.logoScale, config.logoOpacity);
     }
 
-    // 8. Draw Bottom Ticker (Headline)
+    // 6. Ticker
     if (config.tickerText) {
         const tickerFontSize = config.tickerFontSize || 40;
         const tickerPadding = 20;
         const tickerHeight = tickerFontSize + (tickerPadding * 2);
         const tickerY = CANVAS_HEIGHT - tickerHeight;
 
-        // Background Bar for Ticker
         ctx.fillStyle = config.tickerBgColor;
         ctx.shadowColor = 'transparent'; 
         ctx.fillRect(0, tickerY, CANVAS_WIDTH, tickerHeight);
-
-        // Border Top
         ctx.fillStyle = config.tickerColor; 
         ctx.fillRect(0, tickerY, CANVAS_WIDTH, 4);
 
-        // Ticker Text
         ctx.fillStyle = config.tickerColor;
         ctx.font = `bold ${tickerFontSize}px "Hind Siliguri", sans-serif`; 
         ctx.textBaseline = 'middle';
@@ -479,11 +457,9 @@ export const PreviewPlayer: React.FC<PreviewPlayerProps> = ({ config, onChange }
         const loopWidth = textWidth + gap;
         const tickerSpeed = config.tickerSpeed;
         
-        // Calculate offset
         const shift = (time * tickerSpeed) % loopWidth;
         const startX = CANVAS_WIDTH - shift;
 
-        // Draw instances
         ctx.fillText(config.tickerText, startX, tickerY + (tickerHeight / 2));
         ctx.fillText(config.tickerText, startX + loopWidth, tickerY + (tickerHeight / 2));
         ctx.fillText(config.tickerText, startX - loopWidth, tickerY + (tickerHeight / 2));
@@ -492,47 +468,108 @@ export const PreviewPlayer: React.FC<PreviewPlayerProps> = ({ config, onChange }
     ctx.shadowColor = 'transparent';
   };
 
+  // --- Sync Ref with State ---
+  useEffect(() => {
+     if (!isExporting) {
+         currentTimeRef.current = currentTime;
+     }
+  }, [currentTime, isExporting]);
+
   // --- Animation Clock Loop ---
   useEffect(() => {
     let animationFrameId: number;
+    
+    // Cleanup previous worker if any
+    if (workerRef.current) {
+        workerRef.current.terminate();
+        workerRef.current = null;
+    }
 
-    const loop = () => {
-      if (isPlaying || isExporting) {
-        if (config.audioUrl && audioRef.current && isAudioReady && !audioError) {
-          setCurrentTime(audioRef.current.currentTime);
-        } else {
-          const now = performance.now();
-          const delta = (now - lastTimeRef.current) / 1000;
-          lastTimeRef.current = now;
-          setCurrentTime(prev => prev + delta);
-        }
+    if (isExporting) {
+        // --- BACKGROUND FRIENDLY EXPORT LOOP (Web Worker) ---
+        // Using a Blob URL for worker to avoid separate file requirement
+        const blob = new Blob([WORKER_CODE], { type: 'application/javascript' });
+        const worker = new Worker(URL.createObjectURL(blob));
+        workerRef.current = worker;
 
-        if (config.audioUrl && audioRef.current?.ended) {
-            if (isExporting) finishExport();
-            else setIsPlaying(false);
-        }
+        worker.onmessage = () => {
+             // 1. Calculate new time
+             if (config.audioUrl && audioRef.current && isAudioReady && !audioError) {
+                 // Trust audio time if available
+                 currentTimeRef.current = audioRef.current.currentTime;
+             } else {
+                 // Manual increment based on wall clock
+                 const now = performance.now();
+                 const delta = (now - lastTimeRef.current) / 1000;
+                 lastTimeRef.current = now;
+                 currentTimeRef.current += delta;
+             }
+             
+             // 2. Render Frame Synchronously
+             renderFrame(currentTimeRef.current);
+             
+             // 3. Update React State (UI) - might be throttled but that's fine
+             setCurrentTime(currentTimeRef.current);
 
-        animationFrameId = requestAnimationFrame(loop);
-      }
-    };
+             // 4. Check End Condition
+             const isEnded = (config.audioUrl && audioRef.current?.ended) || 
+                             (currentTimeRef.current >= maxDuration + 1); // +1 buffer
+             
+             if (isEnded) {
+                 finishExport(); // Triggers unmount of worker via isExporting change
+             }
+        };
 
-    if (isPlaying || isExporting) {
-      lastTimeRef.current = performance.now();
-      loop();
+        lastTimeRef.current = performance.now();
+        // Start worker ticking at approx video fps
+        worker.postMessage({ action: 'start', fps: config.fps });
+
+    } else if (isPlaying) {
+        // --- STANDARD FOREGROUND LOOP (requestAnimationFrame) ---
+        const loop = () => {
+            if (config.audioUrl && audioRef.current && isAudioReady && !audioError) {
+                const t = audioRef.current.currentTime;
+                currentTimeRef.current = t;
+                setCurrentTime(t);
+            } else {
+                const now = performance.now();
+                const delta = (now - lastTimeRef.current) / 1000;
+                lastTimeRef.current = now;
+                currentTimeRef.current += delta;
+                setCurrentTime(currentTimeRef.current);
+            }
+
+            if (config.audioUrl && audioRef.current?.ended) {
+                setIsPlaying(false);
+            } else if (maxDuration > 0 && currentTimeRef.current >= maxDuration && !config.audioUrl) {
+                setIsPlaying(false);
+            } else {
+                animationFrameId = requestAnimationFrame(loop);
+            }
+        };
+        lastTimeRef.current = performance.now();
+        loop();
     }
 
     return () => {
-      if (animationFrameId) cancelAnimationFrame(animationFrameId);
+        if (animationFrameId) cancelAnimationFrame(animationFrameId);
+        if (workerRef.current) {
+            workerRef.current.terminate();
+            workerRef.current = null;
+        }
     };
-  }, [isPlaying, isExporting, config.audioUrl, isAudioReady, audioError]);
+  }, [isPlaying, isExporting, config.fps, config.audioUrl, isAudioReady, audioError, maxDuration]);
 
-  // --- Paint Effect ---
+
+  // --- Paint Effect (For Dragging/Scrubbing) ---
   useEffect(() => {
+    // We only rely on this for non-playing updates (scrubbing/dragging)
+    // Or if rendering falls behind via state updates
     renderFrame(currentTime);
   }, [currentTime, config, lines, effectiveScrollSpeed, CANVAS_WIDTH, CANVAS_HEIGHT]);
 
 
-  // Start/Stop Logic
+  // Start/Stop Audio Logic
   useEffect(() => {
     if (isExporting) return;
 
@@ -549,7 +586,6 @@ export const PreviewPlayer: React.FC<PreviewPlayerProps> = ({ config, onChange }
             });
         }
         if (config.bgMusicUrl && bgMusicRef.current) {
-            // Safety check for duration
             if (Number.isFinite(bgMusicRef.current.duration) && bgMusicRef.current.duration > 0) {
                  bgMusicRef.current.currentTime = currentTime % bgMusicRef.current.duration;
             }
@@ -584,15 +620,14 @@ export const PreviewPlayer: React.FC<PreviewPlayerProps> = ({ config, onChange }
   const handleExport = async () => {
     if (isExporting) return;
     
-    // 1. Force Resume AudioContext
     if (audioContextRef.current?.state === 'suspended') {
         try { await audioContextRef.current.resume(); } catch(e) { console.error("Ctx Resume Fail", e); }
     }
 
     setIsExporting(true);
     setCurrentTime(0);
+    currentTimeRef.current = 0; // Sync Ref
     
-    // Reset Media Elements
     if (audioRef.current) {
         audioRef.current.currentTime = 0;
         audioRef.current.pause();
@@ -602,12 +637,11 @@ export const PreviewPlayer: React.FC<PreviewPlayerProps> = ({ config, onChange }
         bgMusicRef.current.pause();
     }
     
-    // Small delay to allow state to settle
     setTimeout(() => startRecording(), 300);
   };
 
   const startRecording = async () => {
-    // 2. Start Audio Playback BEFORE Recording
+    // Play audio for recording stream
     const promises = [];
     if (config.audioUrl && audioRef.current && !audioError) {
         promises.push(audioRef.current.play());
@@ -616,19 +650,13 @@ export const PreviewPlayer: React.FC<PreviewPlayerProps> = ({ config, onChange }
         promises.push(bgMusicRef.current.play());
     }
 
-    try {
-        await Promise.all(promises);
-    } catch (e) {
-        console.error("Export audio start error:", e);
-    }
+    try { await Promise.all(promises); } catch (e) {}
     
     setIsPlaying(true);
     lastTimeRef.current = performance.now();
 
-    // Warm-up buffer delay (Critical for audio capture)
     await new Promise(resolve => setTimeout(resolve, 300));
 
-    // 3. Setup Stream & Recorder
     const canvas = canvasRef.current;
     if (!canvas) return;
 
@@ -642,17 +670,16 @@ export const PreviewPlayer: React.FC<PreviewPlayerProps> = ({ config, onChange }
     }
 
     const mimeType = getSupportedMimeType();
-    console.log("Exporting with mimeType:", mimeType);
 
     let recorder;
     try {
         recorder = new MediaRecorder(stream, { 
             mimeType,
-            videoBitsPerSecond: 12000000, // 12 Mbps for high quality
-            audioBitsPerSecond: 320000    // 320 Kbps for clear audio
+            videoBitsPerSecond: 12000000, 
+            audioBitsPerSecond: 320000    
         });
     } catch (e) {
-        alert("Recording failed. Your browser might not support this format. Try Chrome or Edge.");
+        alert("Recording failed. Try Chrome or Edge.");
         setIsExporting(false);
         setIsPlaying(false);
         return;
@@ -670,12 +697,10 @@ export const PreviewPlayer: React.FC<PreviewPlayerProps> = ({ config, onChange }
         a.href = url;
         const ext = mimeType.includes('mp4') ? 'mp4' : 'webm';
         
-        // Use custom file name or default to 'rakib'
         const baseName = (config.exportFileName && config.exportFileName.trim() !== "") 
                          ? config.exportFileName 
                          : "rakib";
         a.download = `${baseName}.${ext}`;
-        
         a.click();
         
         setIsExporting(false);
@@ -688,12 +713,9 @@ export const PreviewPlayer: React.FC<PreviewPlayerProps> = ({ config, onChange }
     mediaRecorderRef.current = recorder;
     recorder.start();
 
-    // Set timeout to stop recording at end
-    const finalDuration = maxDuration;
-    // We rely on the loop to call finishExport when audio ends, 
-    // but if no audio, we set a timeout.
+    // Fallback safety timeout
     if (!config.audioUrl || audioError) {
-        setTimeout(() => finishExport(), (finalDuration + 1) * 1000);
+        setTimeout(() => finishExport(), (maxDuration + 2) * 1000);
     }
   };
 
@@ -701,43 +723,34 @@ export const PreviewPlayer: React.FC<PreviewPlayerProps> = ({ config, onChange }
       if (mediaRecorderRef.current && mediaRecorderRef.current.state === 'recording') {
           mediaRecorderRef.current.stop();
       }
-      // Also stop audio immediately to prevent residual noise
-      if (audioRef.current) audioRef.current.pause();
-      if (bgMusicRef.current) bgMusicRef.current.pause();
+      // Audio stops in onstop handler of recorder usually, but good to be safe
   };
 
-  // --- Mouse Interaction Handlers for Watermark & Logo ---
+  // --- Interaction Handlers ---
   const handleMouseDown = (e: React.MouseEvent<HTMLCanvasElement>) => {
     if (!canvasRef.current) return;
-
     const rect = canvasRef.current.getBoundingClientRect();
     const scaleX = CANVAS_WIDTH / rect.width;
     const scaleY = CANVAS_HEIGHT / rect.height;
-    
     const mouseX = (e.clientX - rect.left) * scaleX;
     const mouseY = (e.clientY - rect.top) * scaleY;
     const ctx = canvasRef.current.getContext('2d');
 
-    // Check collision with LOGO first (since it's usually on top)
     if (config.logoUrl && logoImageRef.current) {
         const lWidth = logoImageRef.current.width * config.logoScale;
         const lHeight = logoImageRef.current.height * config.logoScale;
-        
         if (mouseX >= config.logoX && mouseX <= config.logoX + lWidth &&
             mouseY >= config.logoY && mouseY <= config.logoY + lHeight) {
             isDraggingRef.current = true;
             draggingTargetRef.current = 'logo';
             dragStartRef.current = { x: mouseX, y: mouseY };
             initialPosRef.current = { x: config.logoX, y: config.logoY };
-            return; // Stop checking
+            return;
         }
     }
-
-    // Check collision with IMAGE WATERMARK
     if (config.watermarkUrl && watermarkImageRef.current) {
         const wWidth = watermarkImageRef.current.width * config.watermarkScale;
         const wHeight = watermarkImageRef.current.height * config.watermarkScale;
-        
         if (mouseX >= config.watermarkX && mouseX <= config.watermarkX + wWidth &&
             mouseY >= config.watermarkY && mouseY <= config.watermarkY + wHeight) {
             isDraggingRef.current = true;
@@ -747,15 +760,11 @@ export const PreviewPlayer: React.FC<PreviewPlayerProps> = ({ config, onChange }
             return; 
         }
     }
-
-    // Check collision with TEXT WATERMARK
     if (config.watermarkText && ctx) {
         ctx.font = `bold ${config.watermarkTextFontSize}px 'Inter', sans-serif`;
         const metrics = ctx.measureText(config.watermarkText);
         const wWidth = metrics.width;
-        const wHeight = config.watermarkTextFontSize; // Approx height
-
-        // Basic bbox check
+        const wHeight = config.watermarkTextFontSize;
         if (mouseX >= config.watermarkTextX && mouseX <= config.watermarkTextX + wWidth &&
             mouseY >= config.watermarkTextY && mouseY <= config.watermarkTextY + wHeight) {
              isDraggingRef.current = true;
@@ -768,11 +777,9 @@ export const PreviewPlayer: React.FC<PreviewPlayerProps> = ({ config, onChange }
 
   const handleMouseMove = (e: React.MouseEvent<HTMLCanvasElement>) => {
       if (!isDraggingRef.current || !canvasRef.current || !onChange) return;
-      
       const rect = canvasRef.current.getBoundingClientRect();
       const scaleX = CANVAS_WIDTH / rect.width;
       const scaleY = CANVAS_HEIGHT / rect.height;
-      
       const mouseX = (e.clientX - rect.left) * scaleX;
       const mouseY = (e.clientY - rect.top) * scaleY;
       
@@ -796,10 +803,6 @@ export const PreviewPlayer: React.FC<PreviewPlayerProps> = ({ config, onChange }
       draggingTargetRef.current = null;
   };
 
-  const totalDistance = totalTextHeight + CANVAS_HEIGHT; 
-  const visualDuration = totalDistance / (effectiveScrollSpeed || 50);
-  const maxDuration = config.audioUrl && audioDuration > 0 ? audioDuration : visualDuration;
-
   return (
     <div className="flex-1 bg-black p-6 flex flex-col relative overflow-hidden">
       
@@ -808,7 +811,6 @@ export const PreviewPlayer: React.FC<PreviewPlayerProps> = ({ config, onChange }
       </div>
 
       <div className="w-full flex justify-between items-start shrink-0 relative z-50 mb-4 pointer-events-none">
-         {/* Left: Export Filename Input */}
          <div className="pointer-events-auto bg-slate-900/90 backdrop-blur-md border border-slate-700/50 rounded-xl p-3 shadow-2xl flex flex-col gap-1 opacity-80 hover:opacity-100 transition-opacity">
              <label className="text-[10px] text-slate-500 font-bold tracking-wider uppercase flex items-center gap-1">
                 <FileVideo className="w-3 h-3" /> Output Filename
@@ -882,6 +884,7 @@ export const PreviewPlayer: React.FC<PreviewPlayerProps> = ({ config, onChange }
                     </div>
                     <h3 className="text-xl font-bold">Rendering Video...</h3>
                     <p className="text-slate-400 text-sm mt-2">Recording Realtime Playback (MP4/WebM)...</p>
+                    <p className="text-xs text-slate-500 mt-1 italic">Please wait, do not close this tab.</p>
                     <div className="mt-4 w-64 h-1 bg-slate-800 rounded-full overflow-hidden">
                         <div 
                             className="h-full bg-purple-500 transition-all duration-300 ease-linear"
